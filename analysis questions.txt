@@ -1,0 +1,145 @@
+Analysis Questions
+
+Phase 5: Branching and Checkout
+
+Q5.1: A branch in Git is just a file in .git/refs/heads/ containing a commit hash. Creating a branch is creating a file. Given this, how would you implement pes checkout <branch> -- what files need to change in .pes/, and what must happen to the working directory? What makes this operation complex?
+
+A branch can be represented as a file inside .pes/refs/heads/. The file stores the commit hash at the tip of that branch. To implement pes checkout <branch>, the program would first check that .pes/refs/heads/<branch> exists. It would then read the commit hash stored in that branch file.
+
+The main metadata file that must change is .pes/HEAD. If the user checks out a branch named feature, .pes/HEAD should contain something like:
+
+ref: refs/heads/feature
+
+That means future commits will advance the feature branch.
+
+However, checkout is not only a HEAD change. The working directory must also be updated to match the tree stored in the target branch's latest commit. The checkout operation needs to:
+
+1. Read the target branch file to get the target commit hash.
+2. Read the target commit object.
+3. Read the root tree hash from the commit.
+4. Recursively expand the tree into paths and blob hashes.
+5. Compare the current index and working directory with the target tree.
+6. Refuse checkout if local uncommitted changes would be overwritten.
+7. Delete tracked files that exist in the current branch but not in the target branch.
+8. Write files from the target tree into the working directory.
+9. Replace the index with entries matching the target tree.
+10. Update .pes/HEAD to point to the selected branch.
+
+This operation is complex because it must protect user data. Changing HEAD is easy, but safely changing the working directory is hard. Checkout must handle modified files, deleted files, files added on one branch but not another, nested directories, untracked files that might be overwritten, and the index state.
+
+Q5.2: When switching branches, the working directory must be updated to match the target branch's tree. If the user has uncommitted changes to a tracked file, and that file differs between branches, checkout must refuse. Describe how you would detect this "dirty working directory" conflict using only the index and the object store.
+
+The index represents the clean baseline of the current checkout. For each tracked file, the index stores the blob hash that the working directory should match if it is clean.
+
+To detect a dirty working directory conflict, compare three versions of each path:
+
+index_blob: the blob hash recorded in the current index.
+worktree_blob: the blob hash computed from the current file contents in the working directory.
+target_blob: the blob hash for that path in the target branch's tree.
+
+A tracked file has uncommitted changes when:
+
+worktree_blob != index_blob
+
+The target branch wants to change that file when:
+
+target_blob != index_blob
+
+Therefore, checkout must refuse when both are true:
+
+worktree_blob != index_blob and target_blob != index_blob
+
+That means the user has changed the file locally, and switching branches would replace that same file with a different version from the target branch.
+
+The same idea applies to deletions. If a file is tracked in the index but missing from the working directory, that is a local change. If the target branch would also change or delete that file, checkout should refuse. Also, if the target branch needs to write a tracked file path but an untracked file already exists there, checkout should refuse to avoid overwriting untracked data.
+
+Q5.3: "Detached HEAD" means HEAD contains a commit hash directly instead of a branch reference. What happens if you make commits in this state? How could a user recover those commits?
+
+Normally, .pes/HEAD points to a branch reference, such as:
+
+ref: refs/heads/main
+
+In detached HEAD state, .pes/HEAD contains a commit hash directly instead:
+
+3f2a9c...
+
+This means the repository is checked out at a specific commit, but not through a branch name.
+
+If the user makes commits in detached HEAD state, the new commits are valid commit objects. HEAD moves forward to the new commit hash directly. However, no branch file in .pes/refs/heads/ is updated.
+
+The risk is that when the user later checks out a branch, HEAD will point back to a branch reference. The commits made while detached may no longer be reachable from any branch. They are not immediately invalid, but they can eventually become garbage if nothing references them.
+
+The user can recover those commits by creating a branch that points to the detached commit before leaving detached HEAD:
+
+pes branch saved-work
+
+That would create a file like:
+
+.pes/refs/heads/saved-work
+
+containing the detached commit hash.
+
+If the user already left detached HEAD, recovery requires finding the commit hash. Real Git supports this with the reflog, which records previous HEAD positions. A simple VCS could support recovery by keeping a similar HEAD log, or the user could recover the commit if they had manually recorded its hash.
+
+Phase 6: Garbage Collection and Space Reclamation
+
+Q6.1: Over time, the object store accumulates unreachable objects -- blobs, trees, or commits that no branch points to, directly or transitively. Describe an algorithm to find and delete these objects. What data structure would you use to track "reachable" hashes efficiently? For a repository with 100,000 commits and 50 branches, estimate how many objects you'd need to visit.
+
+Garbage collection can be implemented as a graph traversal.
+
+The root set is every live reference:
+
+.pes/refs/heads/*
+.pes/HEAD, if HEAD is detached
+
+Each branch points to a commit. Starting from those commits, the algorithm marks every object reachable from them:
+
+1. Add all branch head commit hashes to a stack.
+2. Pop a hash from the stack.
+3. If it has already been marked reachable, skip it.
+4. Otherwise, add it to the reachable set.
+5. Read the object from the object store.
+6. If it is a commit, push its parent commit hashes and root tree hash.
+7. If it is a tree, push every child tree hash and blob hash.
+8. If it is a blob, no further traversal is needed.
+
+After traversal, scan the entire object store. Any object hash not in the reachable set is unreachable and can be deleted.
+
+The best data structure for tracking reachable hashes is a hash set. A hash set gives average O(1) insertion and lookup, which is important when checking many object files.
+
+The traversal cost is:
+
+O(number of reachable commits + reachable trees + reachable blobs)
+
+For a repository with 100,000 commits and 50 branches, the algorithm does not visit 100,000 commits per branch, because branches usually share history. Each reachable object is visited once because the reachable set prevents repeated work.
+
+At minimum, if all commits are reachable, GC visits about 100,000 commit objects. It also visits all reachable tree and blob objects. In a real repository, that may mean several hundred thousand or millions of total objects, depending on how many files changed and how many tree objects were created. The important estimate is based on the total number of unique reachable objects, not the number of branches multiplied by the number of commits.
+
+Q6.2: Why is it dangerous to run garbage collection concurrently with a commit operation? Describe a race condition where GC could delete an object that a concurrent commit is about to reference. How does Git's real GC avoid this?
+
+Garbage collection is dangerous during a commit because creating a commit is not a single atomic action. A commit operation usually writes objects first and updates the branch reference last.
+
+A commit may do this:
+
+1. Write new blob objects for changed files.
+2. Write new tree objects that reference those blobs.
+3. Write a new commit object that references the root tree and parent commit.
+4. Update the current branch reference to point to the new commit.
+
+During the early steps, the new objects exist in the object store, but no branch points to the new commit yet. From GC's point of view, those objects may appear unreachable.
+
+A race condition could happen like this:
+
+1. The commit process writes blob B.
+2. The commit process writes tree T that references blob B.
+3. GC starts and reads all branch references.
+4. The new commit has not been written or referenced yet, so GC does not mark B or T as reachable.
+5. GC scans the object store and deletes B and T as unreachable.
+6. The commit process writes commit C referencing tree T.
+7. The commit process updates the branch to point to C.
+
+Now the branch points to commit C, but C references tree T, which was deleted. The repository is corrupted.
+
+Real Git avoids this with several protections. It uses lock files when updating references. It also avoids immediately pruning very new loose objects, so objects created by another process are given a grace period. Git also has reflogs, which keep recently referenced commits reachable for garbage collection purposes. Aggressive immediate pruning is possible, but it is unsafe if another Git process is running.
+
+A simple VCS could avoid this race by using a repository-wide lock so that commit and garbage collection cannot run at the same time. A more advanced system can allow concurrency, but it must coordinate reference updates and avoid deleting recently created objects.
